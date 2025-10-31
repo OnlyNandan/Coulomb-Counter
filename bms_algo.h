@@ -26,6 +26,15 @@ typedef struct {
     bool correction_has_been_applied; // Flag to track if correction applied during current rest period
     
     float last_update_time_us;      // Last update execution time (microseconds)
+    // EKF (optional) small-state estimator
+    bool use_ekf;                   // Enable EKF (SOC + Vrc)
+    float ekf_x[2];                 // EKF state: [SOC_percent, Vrc]
+    float ekf_P[4];                 // EKF covariance matrix (2x2, row-major)
+    float ekf_Q[4];                 // EKF process noise (2x2)
+    float ekf_R;                    // EKF measurement noise (scalar)
+    float r0_ohm;                   // Static ohmic resistance used in measurement model
+    float r1_ohm;                   // Thevenin RC resistance
+    float tau_rc;                   // Thevenin RC time-constant (seconds)
 } BMS_State;
 
 void BMS_Init(BMS_State* state, float initial_soc_percent, float nominal_capacity_ah);

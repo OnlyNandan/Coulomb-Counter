@@ -215,6 +215,18 @@ void BMS_Init(BMS_State* state, float initial_soc_percent, float nominal_capacit
     state->correction_has_been_applied = false;
     
     state->last_update_time_us = 0.0f;
+
+    state->use_ekf = true;
+    state->ekf_x[0] = initial_soc_percent; // SOC (%)
+    state->ekf_x[1] = 0.0f; // Vrc initial
+    state->ekf_P[0] = 0.5f; state->ekf_P[1] = 0.0f;
+    state->ekf_P[2] = 0.0f; state->ekf_P[3] = 0.5f;
+    state->ekf_Q[0] = 1e-6f; state->ekf_Q[1] = 0.0f;
+    state->ekf_Q[2] = 0.0f; state->ekf_Q[3] = 1e-4f;
+    state->ekf_R = 0.01f * 0.01f; 
+    state->r0_ohm = 0.01f;
+    state->r1_ohm = 0.01f;
+    state->tau_rc = 5.0f; // seconds
 }
 
 void BMS_Update(BMS_State* state, float voltage, float current, float temperature, float dt_seconds) {
@@ -229,16 +241,78 @@ void BMS_Update(BMS_State* state, float voltage, float current, float temperatur
     if (coulomb_soc > 100.0f) coulomb_soc = 100.0f;
     
     float ocv_soc = BMS_GetOCVSOC(voltage, temperature);
-    
-    float predicted_soc = coulomb_soc;
-    
-    float predicted_p = state->error_covariance + state->process_noise;
-    
-    state->kalman_gain = predicted_p / (predicted_p + state->measurement_noise);
-    
-    state->soc_percent = predicted_soc + state->kalman_gain * (ocv_soc - predicted_soc);
-    
-    state->error_covariance = (1.0f - state->kalman_gain) * predicted_p;
+
+    if (state->use_ekf) {
+
+        float a = expf(-dt_seconds / state->tau_rc);
+        float b = state->r1_ohm * (1.0f - a);
+
+        float xpred0 = state->ekf_x[0] + (-current * dt_seconds) / (state->current_capacity_ah * 3600.0f) * 100.0f;
+        float xpred1 = a * state->ekf_x[1] + b * current;
+
+        float F00 = 1.0f; float F01 = 0.0f;
+        float F10 = 0.0f; float F11 = a;
+
+        float P00 = F00 * state->ekf_P[0] + F01 * state->ekf_P[2];
+        float P01 = F00 * state->ekf_P[1] + F01 * state->ekf_P[3];
+        float P10 = F10 * state->ekf_P[0] + F11 * state->ekf_P[2];
+        float P11 = F10 * state->ekf_P[1] + F11 * state->ekf_P[3];
+
+        float PP00 = P00 * F00 + P01 * F01 + state->ekf_Q[0];
+        float PP01 = P00 * F10 + P01 * F11 + state->ekf_Q[1];
+        float PP10 = P10 * F00 + P11 * F01 + state->ekf_Q[2];
+        float PP11 = P10 * F10 + P11 * F11 + state->ekf_Q[3];
+
+        const float OCV_MIN = 12.0584f;
+        const float OCV_MAX = 13.4147f;
+        float dOCV_dSOC = (OCV_MAX - OCV_MIN) / 100.0f; 
+
+        float h = (OCV_MIN + (xpred0 / 100.0f) * (OCV_MAX - OCV_MIN)) - current * state->r0_ohm - xpred1;
+
+        float H0 = dOCV_dSOC;
+        float H1 = -1.0f;
+
+        float S = H0 * (PP00 * H0 + PP01 * H1) + H1 * (PP10 * H0 + PP11 * H1) + state->ekf_R;
+        if (S <= 1e-12f) S = 1e-12f;
+
+        float K0 = (PP00 * H0 + PP01 * H1) / S;
+        float K1 = (PP10 * H0 + PP11 * H1) / S;
+
+        float y = voltage - h;
+
+        state->ekf_x[0] = xpred0 + K0 * y;
+        state->ekf_x[1] = xpred1 + K1 * y;
+
+        float KH00 = K0 * H0; float KH01 = K0 * H1;
+        float KH10 = K1 * H0; float KH11 = K1 * H1;
+
+        float I_KH00 = 1.0f - KH00; float I_KH01 = -KH01;
+        float I_KH10 = -KH10; float I_KH11 = 1.0f - KH11;
+
+        state->ekf_P[0] = I_KH00 * PP00 + I_KH01 * PP10;
+        state->ekf_P[1] = I_KH00 * PP01 + I_KH01 * PP11;
+        state->ekf_P[2] = I_KH10 * PP00 + I_KH11 * PP10;
+        state->ekf_P[3] = I_KH10 * PP01 + I_KH11 * PP11;
+
+        state->soc_percent = state->ekf_x[0];
+        if (state->soc_percent < 0.0f) state->soc_percent = 0.0f;
+        if (state->soc_percent > 100.0f) state->soc_percent = 100.0f;
+
+        if (fabsf(current) < REST_PERIOD_THRESHOLD && state->rest_period_timer >= REST_PERIOD_TIME) {
+            state->coulomb_count_uAs = (int64_t)((state->soc_percent / 100.0f) * state->current_capacity_ah * 3600.0f * COULOMB_SCALE_FACTOR);
+        }
+
+    } else {
+        float predicted_soc = coulomb_soc;
+
+        float predicted_p = state->error_covariance + state->process_noise;
+
+        state->kalman_gain = predicted_p / (predicted_p + state->measurement_noise);
+
+        state->soc_percent = predicted_soc + state->kalman_gain * (ocv_soc - predicted_soc);
+
+        state->error_covariance = (1.0f - state->kalman_gain) * predicted_p;
+    }
     
     if (state->soc_percent < 0.0f) state->soc_percent = 0.0f;
     if (state->soc_percent > 100.0f) state->soc_percent = 100.0f;
